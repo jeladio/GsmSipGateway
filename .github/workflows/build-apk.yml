@@ -84,6 +84,7 @@ jobs:
           sed -i -E 's/minSdkVersion = [0-9]+/minSdkVersion = 26/' $APP/android/build.gradle
           grep -q 'minSdkVersion = 26' $APP/android/build.gradle \
             || { echo "ERROR: could not set minSdkVersion = 26 in android/build.gradle"; exit 1; }
+          grep -n 'minSdkVersion' $APP/android/build.gradle $BFILE
 
           sed -i '/buildTypes {/i\    signingConfigs {\n        release {\n            storeFile file("keystore\/release.keystore")\n            storePassword "android123"\n            keyAlias "release"\n            keyPassword "android123"\n        }\n    }\n' $BFILE
           sed -i 's/signingConfig signingConfigs\.debug/signingConfig signingConfigs.release/' $BFILE
@@ -173,9 +174,41 @@ jobs:
           check_string "$WORK/assets/index.android.bundle" "getStatus"
 
           "$BT/aapt2" dump badging "$APK" > "$WORK/badging.txt"
-          grep -E "^(package|sdkVersion|targetSdkVersion)" "$WORK/badging.txt"
-          check_string "$WORK/badging.txt" "sdkVersion:'26'"
+          echo "--- aapt2 badging (sdk lines) ---"
+          grep -E "^(package|sdkVersion|minSdkVersion|targetSdkVersion|maxSdkVersion)" "$WORK/badging.txt" || true
           check_string "$WORK/badging.txt" "android.permission.USE_SIP"
+
+          # Real SDK levels read from the binary manifest inside the APK,
+          # independent of the badging text format.
+          "$BT/aapt2" dump xmltree "$APK" --file AndroidManifest.xml > "$WORK/manifest.txt"
+          echo "--- uses-sdk in APK manifest ---"
+          grep -A3 'E: uses-sdk' "$WORK/manifest.txt" || true
+          sdk_attr() {
+            grep -m1 "android:$1(" "$WORK/manifest.txt" \
+              | sed -E 's/.*\)=//; s/^\(type 0x[0-9a-f]+\)//; s/"//g' || true
+          }
+          to_int() {
+            case "$1" in
+              0x*) echo $(( $1 )) ;;
+              ''|*[!0-9]*) echo '' ;;
+              *) echo "$1" ;;
+            esac
+          }
+          APK_MIN=$(to_int "$(sdk_attr minSdkVersion)")
+          APK_TARGET=$(to_int "$(sdk_attr targetSdkVersion)")
+          GRADLE_MIN=$(grep -oE 'minSdkVersion = [0-9]+' "$GITHUB_WORKSPACE/AppProject/android/build.gradle" \
+            | grep -oE '[0-9]+$' || true)
+          echo "minSdk: APK=${APK_MIN:-?} Gradle=${GRADLE_MIN:-?} | targetSdk: APK=${APK_TARGET:-?}"
+          if [ -z "$APK_MIN" ]; then
+            echo "MISSING minSdkVersion in APK manifest"; FAIL=1
+          else
+            [ "$APK_MIN" = "$GRADLE_MIN" ] \
+              || { echo "MISMATCH minSdk: APK=$APK_MIN Gradle=$GRADLE_MIN"; FAIL=1; }
+            [ "$APK_MIN" -ge 26 ] \
+              || { echo "MISSING minSdk>=26 (code calls API 26 methods)"; FAIL=1; }
+            [ "$APK_MIN" -le 30 ] \
+              || { echo "MISSING minSdk<=30 (must install on Android 11)"; FAIL=1; }
+          fi
 
           [ "$FAIL" -eq 0 ] || { echo "ERROR: APK does not contain the expected changes"; exit 1; }
           echo "APK verification passed"
