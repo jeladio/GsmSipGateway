@@ -80,8 +80,10 @@ jobs:
           sed -i 's/applicationId "com\.appproject"/applicationId "com.gsmsipgateway"/' $BFILE
           sed -i 's/namespace "com\.AppProject"/namespace "com.gsmsipgateway"/' $BFILE
           sed -i 's/applicationId "com\.AppProject"/applicationId "com.gsmsipgateway"/' $BFILE
-          sed -i 's/minSdkVersion = 21/minSdkVersion = 26/' $BFILE
-          sed -i 's/minSdkVersion 21/minSdkVersion 26/' $BFILE
+          # RN 0.73 keeps minSdkVersion in the root build.gradle, not in app/build.gradle
+          sed -i -E 's/minSdkVersion = [0-9]+/minSdkVersion = 26/' $APP/android/build.gradle
+          grep -q 'minSdkVersion = 26' $APP/android/build.gradle \
+            || { echo "ERROR: could not set minSdkVersion = 26 in android/build.gradle"; exit 1; }
 
           sed -i '/buildTypes {/i\    signingConfigs {\n        release {\n            storeFile file("keystore\/release.keystore")\n            storePassword "android123"\n            keyAlias "release"\n            keyPassword "android123"\n        }\n    }\n' $BFILE
           sed -i 's/signingConfig signingConfigs\.debug/signingConfig signingConfigs.release/' $BFILE
@@ -126,6 +128,57 @@ jobs:
           ./gradlew assembleRelease --no-daemon
         env:
           GRADLE_OPTS: "-Xmx4096m -XX:MaxMetaspaceSize=512m"
+
+      - name: Verify APK contains modified sources
+        run: |
+          set -euo pipefail
+          APK=$GITHUB_WORKSPACE/AppProject/android/app/build/outputs/apk/release/app-release.apk
+          test -s "$APK" || { echo "ERROR: APK not found"; exit 1; }
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          WORK=$(mktemp -d)
+          unzip -q -o "$APK" 'classes*.dex' 'assets/index.android.bundle' -d "$WORK"
+          for dex in "$WORK"/classes*.dex; do "$BT/dexdump" "$dex"; done > "$WORK/dexdump.txt"
+          FAIL=0
+
+          # Fields/methods declared directly in the given class (not inner/lambda classes)
+          check_member() {
+            if awk -v cls="'Lcom/gsmsipgateway/$1;'" -v member="'$2'" '
+                /Class descriptor/ { inside = ($NF == cls) }
+                inside && /^ +name +:/ && $NF == member { found = 1 }
+                END { exit !found }
+              ' "$WORK/dexdump.txt"; then
+              echo "OK      $1.$2"
+            else
+              echo "MISSING $1.$2"; FAIL=1
+            fi
+          }
+          check_member LinphoneEngine isSipAvailable
+          check_member LinphoneEngine hasSipPermission
+          check_member LinphoneEngine describeSupport
+          check_member 'LinphoneEngine$BridgeCallback' onSipRegistering
+          check_member GsmSipBridgeService registerRetryRunnable
+          check_member GsmSipBridgeService retryRegistration
+          check_member GsmSipBridgeService setStatus
+          check_member SipBridgeModule getConfig
+          check_member SipBridgeModule getStatus
+          check_member MainActivity onRequestPermissionsResult
+
+          check_string() {
+            if grep -aqF "$2" "$1"; then echo "OK      '$2'"; else echo "MISSING '$2'"; FAIL=1; fi
+          }
+          cat "$WORK"/classes*.dex > "$WORK/all.dex"
+          check_string "$WORK/all.dex" "com.gsmsipgateway.INCOMING_SIP_CALL"
+          check_string "$WORK/all.dex" "SIP_UNSUPPORTED"
+          check_string "$WORK/assets/index.android.bundle" "Loading config..."
+          check_string "$WORK/assets/index.android.bundle" "getStatus"
+
+          "$BT/aapt2" dump badging "$APK" > "$WORK/badging.txt"
+          grep -E "^(package|sdkVersion|targetSdkVersion)" "$WORK/badging.txt"
+          check_string "$WORK/badging.txt" "sdkVersion:'26'"
+          check_string "$WORK/badging.txt" "android.permission.USE_SIP"
+
+          [ "$FAIL" -eq 0 ] || { echo "ERROR: APK does not contain the expected changes"; exit 1; }
+          echo "APK verification passed"
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
